@@ -15,6 +15,15 @@ export default defineNuxtConfig({
     componentDir: './components/ui'
   },
   colorMode: {
-    classSuffix: ''
+    classSuffix: '',
+    preference: 'dark',
+  },
+  css: [
+    'maplibre-gl/dist/maplibre-gl.css'
+  ],
+  runtimeConfig: {
+    public: {
+      maptilerKey: process.env.MAPTILER_KEY
+    }
   }
 })
