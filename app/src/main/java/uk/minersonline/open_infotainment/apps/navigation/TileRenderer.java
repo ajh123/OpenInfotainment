@@ -3,14 +3,15 @@ package uk.minersonline.open_infotainment.apps.navigation;
 import org.lwjgl.*;
 import org.lwjgl.glfw.*;
 import org.lwjgl.opengl.*;
-import org.lwjgl.system.*;
 import org.lwjgl.stb.STBImage;
 import org.lwjgl.system.MemoryStack;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.IntBuffer;
+import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.*;
 
 import static org.lwjgl.glfw.Callbacks.*;
 import static org.lwjgl.glfw.GLFW.*;
@@ -20,19 +21,20 @@ import static org.lwjgl.system.MemoryUtil.*;
 
 public class TileRenderer {
 	private long window;
+	private int viewportWidth = 800;
+	private int viewportHeight = 600;
+	private final int TILE_SIZE = 256;
 
-	// Tile properties
-	private static final int TILE_SIZE = 256; // Assuming tiles are 256x256 pixels
+	private final TileDownloader downloader = new TileDownloader();
+	private final Map<String, ByteBuffer> tileDataCache = new ConcurrentHashMap<>();
+	private final Map<String, Integer> textureCache = new ConcurrentHashMap<>();
+	private final Queue<Runnable> tasks = new ConcurrentLinkedQueue<>();
+	private final ExecutorService executor = Executors.newFixedThreadPool(4);
 
 	public void run() {
 		init();
 		loop();
-
-		// Free resources and terminate
-		glfwFreeCallbacks(window);
-		glfwDestroyWindow(window);
-		glfwTerminate();
-		glfwSetErrorCallback(null).free();
+		cleanup();
 	}
 
 	private void init() {
@@ -43,8 +45,18 @@ public class TileRenderer {
 		glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 		glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
-		window = glfwCreateWindow(800, 600, "Tile Renderer", NULL, NULL);
+		window = glfwCreateWindow(viewportWidth, viewportHeight, "Tile Renderer", NULL, NULL);
 		if (window == NULL) throw new RuntimeException("Failed to create the GLFW window");
+
+		glfwSetFramebufferSizeCallback(window, (win, width, height) -> {
+			viewportWidth = width;
+			viewportHeight = height;
+			glViewport(0, 0, width, height);
+			glMatrixMode(GL_PROJECTION);
+			glLoadIdentity();
+			glOrtho(0, width, height, 0, -1, 1);
+			glMatrixMode(GL_MODELVIEW);
+		});
 
 		glfwMakeContextCurrent(window);
 		glfwSwapInterval(1);
@@ -54,87 +66,121 @@ public class TileRenderer {
 	private void loop() {
 		GL.createCapabilities();
 
-		// Enable transparency
 		glEnable(GL_BLEND);
 		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-		// Enable textures
 		glEnable(GL_TEXTURE_2D);
 
-		// Simple shader setup
 		glMatrixMode(GL_PROJECTION);
 		glLoadIdentity();
-		glOrtho(0, 800, 600, 0, -1, 1);
+		glOrtho(0, viewportWidth, viewportHeight, 0, -1, 1);
 		glMatrixMode(GL_MODELVIEW);
-
-		// Load and bind the texture for a tile
-		int textureId = loadTileTexture(0, 0, 1); // Example coordinates
 
 		while (!glfwWindowShouldClose(window)) {
 			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
 			glLoadIdentity();
 
-			// Render the tile on a plane
-			renderTilePlane(textureId, 100, 100, TILE_SIZE, TILE_SIZE);
+			// Determine the visible tiles based on the viewport size
+			int startX = 0;
+			int startY = 0;
+			int endX = (viewportWidth / TILE_SIZE) + 1;
+			int endY = (viewportHeight / TILE_SIZE) + 1;
+
+			// Render tiles within the visible range
+			renderWorldTiles(startX, startY, endX, endY);
+
+			// Process texture uploads and other tasks
+			processTasks();
 
 			glfwSwapBuffers(window);
 			glfwPollEvents();
 		}
-
-		// Clean up texture
-		glDeleteTextures(textureId);
 	}
 
-	private int loadTileTexture(int x, int y, int z) {
-		TileDownloader downloader = new TileDownloader();
+	private void renderWorldTiles(int startX, int startY, int endX, int endY) {
+		for (int x = startX; x < endX; x++) {
+			for (int y = startY; y < endY; y++) {
+				final int tileX = x;
+				final int tileY = y;
+				final int zoomLevel = 1; // Example zoom level
+
+				final String key = tileX + "_" + tileY + "_" + zoomLevel;
+				if (!textureCache.containsKey(key)) {
+					// Queue tile downloading for the background thread
+					executor.submit(() -> downloadTileData(tileX, tileY, zoomLevel, key));
+				}
+
+				// Render the tile if it is available
+				int textureId = textureCache.getOrDefault(key, -1);
+				if (textureId != -1) {
+					renderTilePlane(textureId, tileX * TILE_SIZE, tileY * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+				}
+			}
+		}
+	}
+
+	private void downloadTileData(int x, int y, int z, String key) {
 		try {
 			byte[] imageData = downloader.getTile(x, y, z);
 
-			// Check if image data is valid
 			if (imageData == null || imageData.length == 0) {
-				throw new RuntimeException("Image data is null or empty");
+				return; // Skip if no data
 			}
 
-			// Use a memory stack to allocate native buffers
-			try (MemoryStack stack = MemoryStack.stackPush()) {
-				IntBuffer width = stack.mallocInt(1);
-				IntBuffer height = stack.mallocInt(1);
-				IntBuffer channels = stack.mallocInt(1);
+			ByteBuffer imageBuffer = ByteBuffer.wrap(imageData);
+			imageBuffer.flip(); // Prepare the buffer for reading
+			tileDataCache.put(key, imageBuffer);
 
-				// Create a ByteBuffer with native order
-				ByteBuffer imageBuffer = stack.malloc(imageData.length).put(imageData);
-				imageBuffer.flip(); // Prepare the buffer for reading
-
-				// Load the image using STBImage
-				ByteBuffer buffer = STBImage.stbi_load_from_memory(imageBuffer, width, height, channels, 4);
-				if (buffer == null) {
-					throw new RuntimeException("Failed to load image: " + STBImage.stbi_failure_reason());
-				}
-
-				// Generate and bind a new OpenGL texture
-				int textureId = glGenTextures();
-				glBindTexture(GL_TEXTURE_2D, textureId);
-
-				// Set texture parameters
-				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-				// Upload the texture data to OpenGL
-				glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width.get(), height.get(), 0, GL_RGBA, GL_UNSIGNED_BYTE, buffer);
-
-				// Free the image memory
-				STBImage.stbi_image_free(buffer);
-
-				return textureId;
-			}
+			// Queue texture upload for the main thread
+			tasks.add(() -> uploadTileTexture(key));
 		} catch (IOException e) {
 			e.printStackTrace();
 		}
+	}
 
-		return -1; // Error case if texture loading fails
+
+	private void uploadTileTexture(String key) {
+		// Ensure this runs on the main thread
+		if (glfwGetCurrentContext() != window) {
+			throw new IllegalStateException("OpenGL context is not current on this thread");
+		}
+
+		ByteBuffer imageBuffer = tileDataCache.remove(key);
+
+		// Check if buffer is valid
+		if (imageBuffer == null) {
+			System.err.println("Invalid image buffer.");
+			return;
+		}
+
+		try (MemoryStack stack = stackPush()) {
+			IntBuffer width = stack.mallocInt(1);
+			IntBuffer height = stack.mallocInt(1);
+			IntBuffer channels = stack.mallocInt(1);
+
+			// Flip the buffer before reading
+			imageBuffer.flip();
+
+			ByteBuffer buffer = STBImage.stbi_load_from_memory(imageBuffer, width, height, channels, 4);
+			if (buffer == null) {
+				System.err.println("Failed to load image data: " + STBImage.stbi_failure_reason());
+				return; // Failed to load image
+			}
+
+			int textureId = glGenTextures();
+			glBindTexture(GL_TEXTURE_2D, textureId);
+
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width.get(), height.get(), 0, GL_RGBA, GL_UNSIGNED_BYTE, buffer);
+
+			STBImage.stbi_image_free(buffer);
+
+			textureCache.put(key, textureId);
+		}
 	}
 
 
@@ -147,6 +193,29 @@ public class TileRenderer {
 		glTexCoord2f(1, 1); glVertex3f(x + width, y + height, 0);
 		glTexCoord2f(0, 1); glVertex3f(x, y + height, 0);
 		glEnd();
+	}
+
+	private void processTasks() {
+		while (!tasks.isEmpty()) {
+			Runnable task = tasks.poll();
+			if (task != null) {
+				// Ensure the task runs on the main thread
+				task.run();
+			}
+		}
+	}
+
+	private void cleanup() {
+		// Delete textures
+		for (int textureId : textureCache.values()) {
+			glDeleteTextures(textureId);
+		}
+
+		executor.shutdown();
+		glfwFreeCallbacks(window);
+		glfwDestroyWindow(window);
+		glfwTerminate();
+		glfwSetErrorCallback(null).free();
 	}
 
 	public static void main(String[] args) {
