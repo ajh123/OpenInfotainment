@@ -23,7 +23,8 @@ export default defineNuxtConfig({
   ],
   runtimeConfig: {
     public: {
-      maptilerKey: process.env.MAPTILER_KEY
+      maptilerKey: process.env.MAPTILER_KEY,
+      openRouteServiceKey: process.env.OPEN_ROUTE_SERVICE_KEY
     }
   }
 })
