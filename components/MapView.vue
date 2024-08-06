@@ -15,18 +15,25 @@
       >
         <Icon icon="radix-icons:minus"/>
       </Button>
+      <Button
+        variant="outline"
+        @click="resetMap"
+      >
+        Reset to Current Location
+      </Button>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { Icon } from '@iconify/vue'
-import { ref, onMounted, onUnmounted, markRaw } from 'vue';
+import { Icon } from '@iconify/vue';
+import { ref, onMounted, onUnmounted } from 'vue';
 import { Map } from 'maplibre-gl';
 
 const mapContainer = ref<HTMLElement|null>(null);
 const map = ref<Map|null>(null);
 const currentZoom = ref(14); // Initial zoom level
+const userLocation = ref<{ lng: number; lat: number } | null>(null); // Store user's location
 
 const isZoomInDisabled = ref(false);
 const isZoomOutDisabled = ref(false);
@@ -39,17 +46,34 @@ const onZoomOutClick = () => {
   map.value!.zoomOut();
 };
 
+const resetMap = () => {
+  if (navigator.geolocation && map.value) {
+    if (userLocation.value) {
+      map.value!.setCenter([userLocation.value.lng, userLocation.value.lat]);
+      map.value!.setZoom(currentZoom.value);
+    } else {
+      // Only notify the user if the map cannot be reset due to location being unavailable
+      console.warn('User location is not available.');
+    }
+  } else {
+    // Notify the user if geolocation is not supported
+    console.warn('Geolocation is not supported.');
+  }
+};
+
 onMounted(() => {
   const config = useRuntimeConfig();
   const apiKey = config.public.maptilerKey;
-  const initialState = { lng: 139.753, lat: 35.6844, zoom: currentZoom.value };
 
-  map.value = markRaw(new Map({
+  // Initialize the map
+  map.value = new Map({
     container: mapContainer.value!,
     style: `https://api.maptiler.com/maps/streets-v2/style.json?key=${apiKey}`,
-    center: [initialState.lng, initialState.lat],
-    zoom: initialState.zoom
-  }));
+    zoom: currentZoom.value
+  });
+
+  // Call resetMap to handle centering the map on the user's current location
+  resetMap();
 
   // Update the current zoom level when the map zoom changes
   map.value!.on('zoom', () => {
